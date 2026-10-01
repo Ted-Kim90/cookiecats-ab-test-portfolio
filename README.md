@@ -11,24 +11,50 @@
 ## 프로젝트 개요
 
 - **데이터셋**: [Mobile Games A/B Testing - Cookie Cats](https://www.kaggle.com/datasets/yufengsui/mobile-games-ab-testing) (Kaggle, 90,189명)
-- **사용 도구**: Python (pandas, scipy, statsmodels, matplotlib)
+- **사용 도구**: MySQL 8.0 (데이터 적재·집계), Python (pandas, pymysql, scipy, statsmodels, matplotlib — 통계 검정·시각화)
 - **비즈니스 질문**: 게임의 첫 번째 진행 게이트(progression gate)를 레벨 30에서
   레벨 40으로 옮기면 유저 리텐션이 개선되는가?
-- **목표**: 가설검정·신뢰구간·부트스트랩·비열등성 검정 등 실무형 A/B 테스트
-  분석 역량을 직접 증명하는 개인 프로젝트
+- **목표**: SQL로 대용량 원본 데이터를 적재·집계하고 Python으로 통계적 유의성을
+  검정하는 실무형 분업 구조를 직접 재현하여, 가설검정·신뢰구간·부트스트랩·
+  비열등성 검정 등 A/B 테스트 분석 역량을 증명하는 개인 프로젝트
 
 ## 폴더 구조
 
 ```
 .
 ├── README.md
+├── requirements.txt
 ├── data/
-│   └── cookie_cats.csv          원본 데이터셋 (Kaggle)
+│   ├── cookie_cats.csv          원본 데이터셋 (Kaggle)
+│   └── cookie_cats_mysql.csv    MySQL 적재용 전처리본 (TRUE/FALSE -> 1/0)
+├── sql/
+│   ├── schema.sql                테이블 생성 DDL
+│   ├── load_data.sql             LOAD DATA INFILE 적재
+│   └── queries.sql               5개 집계 쿼리 (설명 포함)
+├── scripts/
+│   └── prepare_for_mysql.py      적재 전 전처리 스크립트 (Python/pandas)
 ├── notebooks/
-│   ├── analysis.py              jupytext 소스 (버전 관리용)
-│   └── analysis.ipynb           실행 결과 포함 전체 분석 노트북
-└── images/                      노트북에서 생성된 차트
+│   ├── analysis.py               jupytext 소스 (버전 관리용)
+│   └── analysis.ipynb            실행 결과 포함 전체 분석 노트북
+└── images/                       노트북에서 생성된 차트
 ```
+
+## SQL 데이터 적재 및 집계 (MySQL)
+
+원본 CSV를 MySQL에 적재한 뒤, 통계 검정에 들어가기 전 그룹별 샘플 수·리텐션율·
+참여도 요약을 **SQL로 먼저 집계**했습니다. 통계적 유의성 검정(z-test, 부트스트랩
+등)은 Python에서 수행하지만, 대용량 원본 데이터에서 분석용 요약 테이블을
+뽑아내는 것은 SQL의 역할로 분리했습니다 — 실무에서 데이터 웨어하우스(SQL)와
+분석 레이어(Python)가 나뉘어 있는 구조와 동일합니다.
+
+- **전처리 이슈**: 원본 CSV의 `retention_1`/`retention_7`이 TRUE/FALSE 문자열이라
+  MySQL TINYINT 컬럼에 바로 적재하면 묵시적 캐스팅으로 전부 0 처리되는 문제가
+  있어, `scripts/prepare_for_mysql.py`로 1/0 정수로 먼저 변환한 뒤 적재
+- **SQL 집계 결과(발췌)**: 그룹별 샘플 수(gate_30 44,700 / gate_40 45,489),
+  리텐션율(1일 44.82%/44.23%, 7일 19.02%/18.20%), 참여도 평균·표준편차,
+  이상치 상위 5건, NULL/중복 체크 — 전체 쿼리와 결과는 `sql/queries.sql` 참고
+- 노트북(`notebooks/analysis.ipynb`) 4절에서 Python으로 MySQL에 직접 접속(pymysql)해
+  같은 집계를 재실행하고, 두 결과가 일치하는지 교차검증합니다.
 
 ## 문제정의 → 가설 → 실험설계 → 측정 → 개선 사이클
 
@@ -37,7 +63,8 @@
 | **문제정의** | 게이트 위치(레벨 30 vs 40)가 리텐션에 미치는 영향 규명 |
 | **가설수립** | H0/H1 설정 + 1차 지표(리텐션)와 가드레일 지표(참여도)를 사전에 구분 |
 | **실험설계** | 기존 A/B 배정 구조 검증(SRM 체크), 측정 윈도우(1일/7일) 적절성 평가 |
-| **성과측정** | 2-proportion z-test, 부트스트랩 리샘플링, 비열등성 검정, Mann-Whitney U 검정 |
+| **데이터 적재·집계** | MySQL에 적재 후 SQL로 그룹별 샘플 수·리텐션율·참여도 집계 |
+| **성과측정** | 2-proportion z-test, 부트스트랩 리샘플링, 비열등성 검정, Mann-Whitney U 검정 (Python) |
 | **개선/제안** | 게이트 레벨 30 유지 권고 + 데이터 한계와 후속 분석 과제 제시 |
 
 ## 데이터 품질 체크 — 실무형 판단 포인트
@@ -95,7 +122,14 @@
 ## 실행 방법
 
 ```bash
-pip install pandas numpy scipy statsmodels matplotlib jupyter
+# 1. MySQL에 데이터 적재
+mysql -u root < sql/schema.sql
+cd scripts && python3 prepare_for_mysql.py && cd ..
+# cookie_cats_mysql.csv를 MySQL의 secure_file_priv 폴더로 복사한 뒤:
+mysql -u root < sql/load_data.sql
+
+# 2. Python 분석 실행
+pip install -r requirements.txt
 jupyter nbconvert --to notebook --execute notebooks/analysis.ipynb
 ```
 
@@ -104,10 +138,11 @@ jupyter nbconvert --to notebook --execute notebooks/analysis.ipynb
 ## 이력서/자기소개서/면접 활용 예시
 
 > **A/B 테스트(리텐션 실험) 분석 프로젝트 (개인, 2026)**
-> 모바일 게임 A/B 테스트 공개 데이터(9만 건)를 Python으로 분석해 진행 게이트
-> 위치 변경이 리텐션에 미치는 영향을 검증. 2-proportion z-test, 부트스트랩,
-> 비열등성 검정으로 7일 리텐션의 유의한 하락(p=0.0016)을 확인하고, SRM 체크·
-> 가드레일 지표 설계 등 실무형 실험 검증 절차를 직접 수행.
+> 모바일 게임 A/B 테스트 공개 데이터(9만 건)를 MySQL에 적재·집계하고 Python으로
+> 통계적 유의성을 검정해 진행 게이트 위치 변경이 리텐션에 미치는 영향을 검증.
+> 2-proportion z-test, 부트스트랩, 비열등성 검정으로 7일 리텐션의 유의한
+> 하락(p=0.0016)을 확인하고, SRM 체크·가드레일 지표 설계 등 실무형 실험 검증
+> 절차를 직접 수행.
 
 **면접/지원서 질문에 이렇게 쓸 수 있습니다** ("직접 문제정의→가설→실험설계→
 성과측정→개선을 수행한 경험을 서술하라" 유형):

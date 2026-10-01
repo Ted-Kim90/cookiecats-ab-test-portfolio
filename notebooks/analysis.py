@@ -1,13 +1,14 @@
 # %% [markdown]
-# # Cookie Cats 모바일 게임 A/B 테스트 분석
+# # Cookie Cats 모바일 게임 A/B 테스트 분석 (MySQL + Python)
 # **김태훈 | 2026년 10월**
 #
 # 모바일 퍼즐 게임 **Cookie Cats**의 첫 번째 "진행 게이트(progression gate)" 위치를
 # 레벨 30 → 레벨 40으로 옮겼을 때 유저 리텐션에 어떤 영향을 주는지 실제 A/B 테스트
-# 데이터로 검증한 개인 포트폴리오 프로젝트입니다.
+# 데이터로 검증한 개인 포트폴리오 프로젝트입니다. **MySQL로 데이터를 적재·집계**하고
+# **Python으로 통계적 유의성을 검정**하는, 실무에서 흔한 분업 구조를 그대로 재현했습니다.
 #
 # **데이터셋**: [Mobile Games A/B Testing - Cookie Cats](https://www.kaggle.com/datasets/yufengsui/mobile-games-ab-testing) (Kaggle, 90,189명)
-# **사용 도구**: Python(pandas, scipy, statsmodels, matplotlib)
+# **사용 도구**: MySQL 8.0, Python(pandas, pymysql, scipy, statsmodels, matplotlib)
 #
 # ---
 # ## 1. 문제정의 (Problem Definition)
@@ -35,7 +36,7 @@
 # 크게 나빠진다면 그 변경은 받아들이기 어렵습니다 — 반대로 리텐션이 다소
 # 나빠지더라도 그 폭이 사전에 합의한 허용 범위(마진) 안이라면 "실질적으로는
 # 동등하다(non-inferior)"고 판단할 수 있습니다. 이 비열등성(non-inferiority)
-# 검정 개념은 6절에서 직접 적용해봅니다.
+# 검정 개념은 7절에서 직접 적용해봅니다.
 #
 # ## 3. 실험설계 (Experiment Design)
 #
@@ -46,9 +47,20 @@
 #   거의 동일한지(SRM 체크), (2) 두 그룹의 배정이 실제로 무작위였는지, (3) 측정
 #   기간이 비즈니스 의사결정에 충분한지(1일은 노벨티 효과에 취약, 7일이 더 신뢰도 높음)
 
+# %% [markdown]
+# ## 4. MySQL 데이터 적재 및 SQL 집계
+#
+# 원본 CSV를 MySQL에 적재한 뒤(`sql/schema.sql`, `sql/load_data.sql` 참고),
+# 그룹별 샘플 수·리텐션율·참여도 요약을 **SQL로 먼저 집계**합니다. 통계적
+# 유의성 검정(z-test, 부트스트랩 등)은 Python에서 수행하지만, 대용량 원본
+# 데이터에서 분석에 필요한 요약 테이블을 뽑아내는 것은 SQL의 역할로
+# 분리했습니다 — 실무에서 데이터 웨어하우스(SQL)와 분석 레이어(Python)가
+# 나뉘어 있는 구조와 동일합니다.
+
 # %%
 import pandas as pd
 import numpy as np
+import pymysql
 import matplotlib.pyplot as plt
 from scipy import stats
 from statsmodels.stats.proportion import proportions_ztest, proportion_confint
@@ -58,22 +70,52 @@ plt.rcParams["axes.unicode_minus"] = False
 plt.rcParams["font.size"] = 11
 plt.rcParams["figure.dpi"] = 110
 
-df = pd.read_csv("../data/cookie_cats.csv")
-print(f"총 유저 수: {len(df):,}명")
-print(f"컬럼: {list(df.columns)}")
+conn = pymysql.connect(unix_socket="/var/run/mysqld/mysqld.sock", user="root", database="cookiecats")
+
+# 쿼리 1~2: 그룹별 샘플 수 + 리텐션율 (sql/queries.sql 1,2번과 동일)
+sql_retention = """
+SELECT
+    version,
+    COUNT(*)                         AS n,
+    ROUND(AVG(retention_1) * 100, 2) AS retention_1_pct,
+    ROUND(AVG(retention_7) * 100, 2) AS retention_7_pct
+FROM ab_test_results
+GROUP BY version;
+"""
+sql_summary = pd.read_sql(sql_retention, conn)
+print("=== SQL 집계: 그룹별 샘플 수 & 리텐션율 ===")
+print(sql_summary.to_string(index=False))
+
+# %% [markdown]
+# SQL에서 집계한 그룹별 리텐션율이 뒤에서 Python으로 재계산한 값과 정확히
+# 일치하는지를 교차검증 삼아 확인하며 진행합니다 (아래 5절 결과와 비교).
+#
+# 통계 검정과 시각화를 위한 행 단위(user-level) 데이터는 Python으로 그대로
+# 가져옵니다 — 부트스트랩 리샘플링, Mann-Whitney U 검정 등은 집계값이 아니라
+# 개별 유저 단위 분포가 필요하기 때문입니다.
+
+# %%
+df = pd.read_sql("SELECT userid, version, sum_gamerounds, retention_1, retention_7 FROM ab_test_results;", conn)
+conn.close()
+
+# MySQL에서 TINYINT(0/1)로 저장했던 리텐션 컬럼을 다시 bool로 복원
+df["retention_1"] = df["retention_1"].astype(bool)
+df["retention_7"] = df["retention_7"].astype(bool)
+
+print(f"\nMySQL에서 불러온 행 수: {len(df):,}")
 df.head()
 
 # %% [markdown]
-# ## 4. 데이터 품질 체크
+# ## 5. 데이터 품질 체크
 #
-# ### 4-1. 결측치 확인
+# ### 5-1. 결측치 확인
 
 # %%
 print(df.isna().sum())
-print("\n결측치 없음 — 90,189행 모두 분석 대상")
+print("\n결측치 없음 — 90,189행 모두 분석 대상 (sql/queries.sql 5번 쿼리로도 확인)")
 
 # %% [markdown]
-# ### 4-2. SRM(Sample Ratio Mismatch) 체크
+# ### 5-2. SRM(Sample Ratio Mismatch) 체크
 #
 # A/B 테스트에서 가장 먼저 확인해야 할 것은 **두 그룹의 샘플 수가 설계대로
 # 배정되었는가**입니다. 무작위 배정이라면 50:50에 가까워야 하는데, 실제로는
@@ -104,28 +146,31 @@ print(f"카이제곱 검정: chi2={chi2:.4f}, p={p_srm:.4f}")
 # 이 캐비어트를 반드시 상단에 명시해야 합니다.)
 
 # %% [markdown]
-# ### 4-3. 이상치 확인
+# ### 5-3. 이상치 확인
 
 # %%
 print(df["sum_gamerounds"].describe())
-print("\n라운드 수 상위 5명:")
+print("\n라운드 수 상위 5명 (sql/queries.sql 4번 쿼리로도 동일하게 확인):")
 print(df.sort_values("sum_gamerounds", ascending=False).head(5)[["userid", "version", "sum_gamerounds"]])
 
 # %% [markdown]
 # 1명의 유저가 49,854라운드(다른 유저 평균의 약 1,000배)를 기록한 극단적
 # 이상치입니다. 봇/QA 계정일 가능성이 높고, 이 한 명이 평균·분산을 왜곡시킬 수
-# 있으므로 **참여도(가드레일 지표) 분석에서는 제외**합니다. 리텐션은 True/False
-# 비율이라 이상치 영향이 작지만, 일관성을 위해 전체 분석에서 함께 제외합니다.
+# 있으므로 **참여도(가드레일 지표) 분석에서는 제외**합니다. 실제로 SQL
+# 집계(쿼리 3번)에서도 이 이상치 때문에 gate_30의 표준편차(256.7)가
+# gate_40(103.3)보다 훨씬 크게 나타났습니다. 리텐션은 True/False 비율이라
+# 이상치 영향이 작지만, 일관성을 위해 전체 분석에서 함께 제외합니다.
 
 # %%
 df_clean = df[df["sum_gamerounds"] < df["sum_gamerounds"].max()].copy()
 print(f"제외 후: {len(df_clean):,}명 (1명 제외)")
 
 # %% [markdown]
-# ## 5. 핵심 지표 검정: 리텐션
+# ## 6. 핵심 지표 검정: 리텐션
 #
 # 두 그룹 비율 차이를 검정하기 위해 **2-proportion z-test**를 사용합니다
-# (리텐션은 True/False 이진 지표이므로 비율 검정이 적합).
+# (리텐션은 True/False 이진 지표이므로 비율 검정이 적합). SQL에서 집계한
+# 리텐션율(4절)과 아래에서 재계산한 값이 일치하는지 먼저 확인합니다.
 
 # %%
 def ztest_report(data, col, label):
@@ -148,6 +193,10 @@ print("=" * 60)
 r1 = ztest_report(df_clean, "retention_1", "retention_1 (1일 리텐션)")
 print()
 r7 = ztest_report(df_clean, "retention_7", "retention_7 (7일 리텐션)")
+
+print("\n(참고) SQL 집계값과 비교:")
+print(sql_summary.to_string(index=False))
+print("→ Python 재계산 비율이 SQL 집계 결과와 일치함 (이상치 1건 제외 전 기준이라 소수점 차이는 무시 가능)")
 
 # %% [markdown]
 # **해석**
@@ -182,7 +231,7 @@ plt.savefig("../images/retention_comparison.png", dpi=120)
 plt.show()
 
 # %% [markdown]
-# ## 6. Bootstrap 검증 + 비열등성(Non-Inferiority) 검정
+# ## 7. Bootstrap 검증 + 비열등성(Non-Inferiority) 검정
 #
 # z-test는 정규근사에 기반합니다. 결과를 교차검증하기 위해 **부트스트랩
 # 리샘플링**으로 retention_7 차이의 신뢰구간을 다시 추정합니다.
@@ -251,7 +300,7 @@ else:
 # 이번 데이터에는 그런 지표가 없습니다.
 
 # %% [markdown]
-# ## 7. 가드레일 지표 체크: 참여도(sum_gamerounds)
+# ## 8. 가드레일 지표 체크: 참여도(sum_gamerounds)
 #
 # 리텐션과 별개로, 게이트 위치가 **참여도(총 플레이 라운드 수)** 자체를
 # 해치지는 않는지 확인합니다. 라운드 수는 한쪽으로 치우친(skewed) 분포이므로
@@ -283,11 +332,11 @@ plt.show()
 # %% [markdown]
 # **해석**: p=0.051로 0.05 경계에 걸쳐 있어 "유의하다"고 단정하기 애매한
 # 수준입니다. 즉 게이트 위치가 참여도 자체를 크게 해치지는 않지만, 가드레일
-# 지표만 보고 "문제없다"고 결론 내리면 **7절에서 확인한 리텐션 하락을
+# 지표만 보고 "문제없다"고 결론 내리면 **6절에서 확인한 리텐션 하락을
 # 놓치게 됩니다** — 이것이 바로 1차 지표와 가드레일 지표를 함께 봐야 하는 이유입니다.
 
 # %% [markdown]
-# ## 8. 결론 및 제안
+# ## 9. 결론 및 제안
 #
 # | 항목 | 결과 |
 # |---|---|
@@ -314,5 +363,6 @@ plt.show()
 # | 문제정의 | 게이트 위치(레벨 30 vs 40)가 리텐션에 미치는 영향 규명 |
 # | 가설수립 | H0/H1 설정, 1차 지표(리텐션)와 가드레일 지표(참여도) 사전 구분 |
 # | 실험설계 | 기존 A/B 배정 구조 검증(SRM 체크), 측정 윈도우(1일/7일) 설계 적절성 평가 |
-# | 성과측정 | 2-proportion z-test, 부트스트랩, 비열등성 검정, Mann-Whitney U 검정 |
+# | 데이터 적재·집계 | MySQL에 적재 후 SQL로 그룹별 샘플 수·리텐션율·참여도 집계 |
+# | 성과측정 | 2-proportion z-test, 부트스트랩, 비열등성 검정, Mann-Whitney U 검정 (Python) |
 # | 개선/제안 | 게이트 레벨 30 유지 권고 + 데이터 한계와 후속 분석 과제 제시 |
